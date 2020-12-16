@@ -1,0 +1,22 @@
+{
+  "extends": "../tsconfig-common.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "."
+  },
+  "include": [
+    "./"
+  ],
+  "exclude": [
+    "dist/",
+    "*.d.ts"
+  ],
+  "references": [
+    {
+      "path": "../packages/@ubo/core"
+    },
+    {
+      "path": "../packages/@ubo/cli"
+    }
+  ],
+}

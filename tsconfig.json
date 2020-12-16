@@ -1,0 +1,8 @@
+{
+    "references": [
+        { "path": "packages/@ubo/core" },
+        { "path": "packages/@ubo/cli" },
+        { "path": "packages/@ubo/webapp" },
+        { "path": "sandbox"}
+    ]
+}

@@ -1,0 +1,7 @@
+node_modules
+yarn.lock
+.vscode
+tsconfig.tsbuildinfo
+**/dist
+**/lib/**/*.js
+**/lib/**/*.d.ts

@@ -1,0 +1,20 @@
+{
+    "name": "@ubo/sandbox",
+    "version": "0.1.0",
+    "main": "index.js",
+    "license": "MIT",
+    "dependencies": {
+      "bluebird": "^3.7.2",
+      "@ubo/core": "^0.1.0",
+      "@ubo/cli": "^0.1.0",
+      "lodash": "^4.17.20",
+      "mongoose": "^5.10.7"
+    },
+    "devDependencies": {
+      "typescript": "^4.1.2",
+      "ts-node": "^9.1.1",
+      "@types/bluebird": "^3.5.20",
+        "@types/lodash": "^4.14.164",
+        "@types/mongoose": "^5.5.43"
+    }
+  }
