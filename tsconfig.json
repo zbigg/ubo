@@ -1,4 +1,5 @@
 {
+    "extends": "./tsconfig-common.json",
     "references": [
         { "path": "packages/@ubo/core" },
         { "path": "packages/@ubo/cli" },

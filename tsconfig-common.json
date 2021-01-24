@@ -7,8 +7,8 @@
             "dom"
         ],
         "module": "commonjs",
-        "rootDir": "packages",
-        "baseUrl": "packages",
+        //"rootDir": "packages",
+        //"baseUrl": "packages",
         "outDir": "lib/",
         "sourceMap": false,
         "declaration": true,

@@ -1,7 +1,6 @@
 // tslint:disable:no-console
 
-//import { MessageChannel} from 'worker_threads';
-import { isObservable, Observable, pipe, Subject, Subscriber, Subscription } from "rxjs";
+import { isObservable, Observable, Subject, Subscription } from "rxjs";
 import { multicast, refCount } from "rxjs/operators";
 
 type PropertyResolveType<P> = P extends (...args: any) => any ? ReturnType<P> : P;
@@ -9,10 +8,15 @@ type PropertyCallParams<P> = P extends (...args: any) => any ? Parameters<P> : [
 
 type DepromisifyType<T> = T extends PromiseLike<infer K> ? K : T;
 
+type MakeReturnType<T> =
+    T extends Observable<any> ? T :
+    T extends Promise<any> ? T :
+    Promise<DepromisifyType<T>>
+
 export type PromisifyMethods<P> = {
     [K in keyof P]: (
         ...args: PropertyCallParams<P[K]>
-    ) => Promise<DepromisifyType<PropertyResolveType<P[K]>>>;
+    ) => MakeReturnType<PropertyResolveType<P[K]>>;
 };
 
 // tslint:disable:no-shadowed-variable
@@ -47,7 +51,7 @@ function extractTransferableError(error: any): TransferableError {
     }
 }
 
-function rebuildRuntimeError(error: TransferableError | Error) {
+function rebuildRuntimeError(error: TransferableError | Error): Error {
     if (error instanceof Error) {
         return error;
     }
@@ -65,18 +69,18 @@ function rebuildRuntimeError(error: TransferableError | Error) {
  *
  * Serializing special objects, automatically extracting transferable objects etc.
  */
-interface ChannelDataProcessor {
-    processPostArgs(args: unknown[]): [unknown[], Transferable[]];
-    processRecvArgs(error: TransferableError | unknown, ret: unknown): [TransferableError | Error | undefined, unknown];
+interface WireFormatProcessor {
+    toWireFormat(args: unknown[]): [unknown[], Transferable[]];
+    fromWireFormat(error: TransferableError | unknown, ret: unknown): [TransferableError | Error | undefined, unknown];
 }
 
 const EMPTY_ARRAY: Transferable[] = [];
-const noopChannelDataProcessor: ChannelDataProcessor = {
-    processPostArgs(args: unknown[]) {
+export const noopChannelDataProcessor: WireFormatProcessor = {
+    toWireFormat(args: unknown[]) {
         return [args, EMPTY_ARRAY];
     },
-    processRecvArgs(error: TransferableError | Error | undefined, ret: unknown) {
-        return [error, ret];
+    fromWireFormat(error: TransferableError | Error | undefined, ret: unknown) {
+        return [error && rebuildRuntimeError(error), ret];
     }
 }
 
@@ -125,25 +129,72 @@ export function getTransferList(args: any[]): Transferable[] {
  * Channel Data processor that extracts transferable objects.
  *
  */
-export const basicWorkerChannelDataProcessor: ChannelDataProcessor = {
-    processPostArgs(args: unknown[]) {
+export const basicWebWorkerChannelDataProcessor: WireFormatProcessor = {
+    toWireFormat(args: unknown[]) {
         const transferList = getTransferList(args);
         return [args, transferList];
     },
-    processRecvArgs(error: TransferableError | undefined, ret: unknown) {
-        // TODO, can we compose stacks here ?
-        return [error, ret];
+    fromWireFormat(error: TransferableError | undefined, ret: unknown) {
+        return [error && rebuildRuntimeError(error), ret];
     }
 
 }
 
-enum ChannelAction {
+enum ChannelMessageType {
     CALL,     // C->S, create request channel
     CLOSE,    // C->S, close request with observable
     NEXT,     // next value (observable)
     ERROR,    // *error - both for (observable and promise)
     COMPLETE, // complete with no value (observables)
-    RESOLVE,  // S->C, kind of next & resolve (promise)
+    RESOLVE,  // S->C, kind of next & complete iow. resolve (promise)
+}
+
+interface CallMessage {
+    type: ChannelMessageType.CALL,
+    channelId: number,
+    method: string,
+    args: unknown[],
+    channelArgs?: number[]
+}
+
+interface CloseMessage {
+    type: ChannelMessageType.CLOSE;
+    channelId: number;
+}
+
+interface CompleteMessage {
+    type: ChannelMessageType.COMPLETE;
+    channelId: number;
+}
+
+interface ResolveMessage {
+    type: ChannelMessageType.RESOLVE;
+    channelId: number;
+    data: unknown;
+}
+
+interface NextMessage {
+    type: ChannelMessageType.NEXT;
+    channelId: number;
+    data: unknown;
+}
+
+interface ErrorMessage {
+    type: ChannelMessageType.ERROR;
+    channelId: number;
+    data: TransferableError;
+}
+
+type ChannelMessage = CallMessage | NextMessage | CompleteMessage | ResolveMessage | ErrorMessage | CloseMessage;
+
+function postChannelMessage(port: MessagePort, message: ChannelMessage, transferList?: Transferable[]) {
+    port.postMessage(message, transferList || [])
+}
+
+function isChannelMessage(input: unknown): input is ChannelMessage {
+    const message = input as Partial<ChannelMessage>;
+    return typeof message.type === 'number' && message.type in ChannelMessageType &&
+        typeof message.channelId === 'number';
 }
 /**
  * Communicate with service `P` using `MessagePort`.
@@ -182,9 +233,9 @@ export class RpcCommunicator<P> {
     private nextCallChannelId: number = 0;
     private nextOutChannelId: number = 0;
     private port: MessagePort;
-    private channelDataProcessor: ChannelDataProcessor;
+    private channelDataProcessor: WireFormatProcessor;
 
-    constructor(port: MessagePort, channelDataProcessor?: ChannelDataProcessor) {
+    constructor(port: MessagePort, channelDataProcessor?: WireFormatProcessor) {
         this.port = port;
         this.port.onmessage = this.onMessage;
         this.channelDataProcessor = channelDataProcessor || noopChannelDataProcessor;
@@ -207,9 +258,10 @@ export class RpcCommunicator<P> {
     }
 
     onMessage = (event: MessageEvent) => {
+        console.log("RpcCommunicator#onMessage", event);
         const message = event.data;
-        if (message.channelId !== undefined) {
-            this.handleChannelEvent(message.channelId, message.action, message.data);
+        if (isChannelMessage(message)) {
+            this.handleChannelMessage(message);
         } else {
             console.log(`MessagePortProtocolAdapter unknown message type: ${message.type}`);
         }
@@ -220,25 +272,25 @@ export class RpcCommunicator<P> {
         ...args: AddTransferable<PropertyCallParams<P[K]>>
     ): Promise<R> & Observable<R> {
         const [args1, channels] = this.extractOutChannelsForArgs(args);
-        const [massagesArgs, transferList] = this.channelDataProcessor.processPostArgs(args1);
+        const [massagesArgs, transferList] = this.channelDataProcessor.toWireFormat(args1);
         const channelId = this.nextCallChannelId++;
         // TODO, maybe capture call stack using stuff like AsyncResource
         //  https://nodejs.org/api/async_hooks.html
-        this.port.postMessage(
+        postChannelMessage(this.port,
             {
-                action: ChannelAction.CALL,
-                method: type,
+                type: ChannelMessageType.CALL,
+                method: type as string,
                 channelId,
                 args: massagesArgs,
-                argChannels: channels
+                channelArgs: channels
             },
             transferList
         );
-        const [s,o] = createClosableSubject<R>(() => {
-            this.port.postMessage({
-                action: ChannelAction.CLOSE,
+        const [s, o] = createClosableSubject<R>(() => {
+            postChannelMessage(this.port, {
+                type: ChannelMessageType.CLOSE,
                 channelId
-            })
+            });
             this.callChannels.delete(channelId);
         });
         this.callChannels.set(channelId, s);
@@ -288,41 +340,40 @@ export class RpcCommunicator<P> {
     private createOutChannel(observable: Observable<unknown>) {
         const channelId = this.nextOutChannelId++
 
-        const subscription = observable.subscribe(next => {
-            this.port.postMessage(
-                {
-                    channelId,
-                    action: ChannelAction.NEXT,
-                    data: next
-                }
-            );
-        }, error => {
-            this.port.postMessage(
-                {
-                    channelId,
-                    action: ChannelAction.ERROR,
-                    data: extractTransferableError(error)
-                }
-            );
-            subscription.unsubscribe();
-            this.outSubscriptions.delete(channelId);
-        }, () => {
-            this.port.postMessage(
-                {
-                    channelId,
-                    action: ChannelAction.COMPLETE
-                }
-            );
-            subscription.unsubscribe();
-            this.outSubscriptions.delete(channelId);
-        });
+        const subscription = observable.subscribe(
+            next => postChannelMessage(this.port, {
+                channelId,
+                type: ChannelMessageType.NEXT,
+                data: next
+            }),
+            error => {
+                postChannelMessage(this.port,
+                    {
+                        type: ChannelMessageType.ERROR,
+                        channelId,
+                        data: extractTransferableError(error)
+                    }
+                );
+                subscription.unsubscribe();
+                this.outSubscriptions.delete(channelId);
+            }, () => {
+                postChannelMessage(this.port,
+                    {
+                        channelId,
+                        type: ChannelMessageType.COMPLETE
+                    }
+                );
+                subscription.unsubscribe();
+                this.outSubscriptions.delete(channelId);
+            });
         this.outSubscriptions.set(channelId, subscription);
 
         return channelId;
     }
 
-    private handleChannelEvent(channelId: any, action: ChannelAction, data: any) {
-        if (action === ChannelAction.CLOSE) {
+    private handleChannelMessage(message: ChannelMessage) {
+        const channelId = message.channelId;
+        if (message.type === ChannelMessageType.CLOSE) {
             // S closed one of our "arg out" channels
             const o = this.outSubscriptions.get(channelId);
             if (o) {
@@ -338,22 +389,22 @@ export class RpcCommunicator<P> {
             return;
         }
 
-        if (action === ChannelAction.RESOLVE) {
+        if (message.type === ChannelMessageType.RESOLVE) {
             // S resolved promise
-            const [_, data2] = this.channelDataProcessor.processRecvArgs(undefined, data);
-            subscriber.next(data2)
+            const [_, decodedData] = this.channelDataProcessor.fromWireFormat(undefined, message.data);
+            subscriber.next(decodedData)
             subscriber.complete();
             this.callChannels.delete(channelId);
-        } else if (action === ChannelAction.NEXT) {
+        } else if (message.type === ChannelMessageType.NEXT) {
             // S send observable update
-            const [_, data2] = this.channelDataProcessor.processRecvArgs(undefined, data);
-            subscriber.next(data2)
-        } else if (action === ChannelAction.ERROR) {
+            const [_, decodedData] = this.channelDataProcessor.fromWireFormat(undefined, message.data);
+            subscriber.next(decodedData)
+        } else if (message.type === ChannelMessageType.ERROR) {
             // S send observable or promise error
             this.callChannels.delete(channelId);
-            const [error2] = this.channelDataProcessor.processRecvArgs(data, undefined);
-            subscriber.error(error2);
-        } else if (action === ChannelAction.COMPLETE) {
+            const [decodedError] = this.channelDataProcessor.fromWireFormat(message.data, undefined);
+            subscriber.error(decodedError);
+        } else if (message.type === ChannelMessageType.COMPLETE) {
             // S completed channel
             this.callChannels.delete(channelId);
             subscriber.complete();
@@ -393,8 +444,7 @@ export class RpcServiceAdapter<P> {
     private argInChannels: Map<number, [Subject<any>, Observable<any>]> = new Map();
     private callOutChannels: Map<number, Subscription> = new Map();
 
-
-    constructor(readonly port: MessagePort, readonly protocolImpl: P) {
+    constructor(readonly port: MessagePort, readonly protocolImpl: P, readonly wireFormatProcessor: WireFormatProcessor) {
         // Why the hell addEventListener doesn't work here !?
         // port.addEventListener("message", this.onMessage);
         port.onmessage = this.onMessage;
@@ -418,21 +468,23 @@ export class RpcServiceAdapter<P> {
     }
 
     private onMessage = (event: MessageEvent) => {
+        console.log("RpcServiceAdapter#onMessage", event);
         const message = event.data;
-        if (message.channelId !== undefined) {
-            this.handleChannelEvent(message.action, message.channelId, message);
+        if (isChannelMessage(message)) {
+            this.handleChannelMessage(message);
         } else {
 
         }
     };
 
-    private handleChannelEvent(action: ChannelAction, channelId: number, message: any) {
-        if (action === ChannelAction.CALL) {
-            this.handleCall(channelId, message.method, message.args, message.channelArgs);
+    private handleChannelMessage(message: ChannelMessage) {
+        if (message.type === ChannelMessageType.CALL) {
+            this.handleCall(message.channelId, message.method as keyof P, message.args, message.channelArgs);
             return;
         }
 
-        if (action === ChannelAction.CLOSE) {
+        const channelId = message.channelId;
+        if (message.type === ChannelMessageType.CLOSE) {
             // C closed one of our "call out" channels
             const x = this.callOutChannels.get(channelId);
             if (x) {
@@ -447,19 +499,19 @@ export class RpcServiceAdapter<P> {
         if (!entry) {
             return;
         }
-        const [subject,_] = entry;
+        const [subject, _] = entry;
         if (subject.closed) {
             return;
         }
 
-        if (action === ChannelAction.NEXT) {
-            // const [_, data2] = this.channelDataProcessor.processRecvArgs(undefined, data);
-            subject.next(message.data)
-        } else if (action === ChannelAction.ERROR) {
+        if (message.type === ChannelMessageType.NEXT) {
+            const [_, decodedData] = this.wireFormatProcessor.fromWireFormat(undefined, message.data);
+            subject.next(decodedData)
+        } else if (message.type === ChannelMessageType.ERROR) {
             this.argInChannels.delete(channelId);
-            // const [error2] = this.channelDataProcessor.processRecvArgs(data, undefined);
-            subject.error(message.data);
-        } else if (action === ChannelAction.COMPLETE) {
+            const [decodedError] = this.wireFormatProcessor.fromWireFormat(message.data, undefined);
+            subject.error(decodedError);
+        } else if (message.type === ChannelMessageType.COMPLETE) {
             this.argInChannels.delete(channelId);
             subject.complete();
         }
@@ -487,9 +539,9 @@ export class RpcServiceAdapter<P> {
         if (isObservable(result)) {
             const subscription = result.subscribe(next => {
                 // TODO: encode next
-                this.port.postMessage(
+                postChannelMessage(this.port,
                     {
-                        action: ChannelAction.NEXT,
+                        type: ChannelMessageType.NEXT,
                         channelId,
                         data: next
                     }
@@ -497,9 +549,9 @@ export class RpcServiceAdapter<P> {
             }, error => {
                 // TODO: encode error
                 console.error("RpcServiceAdapter: forwarding error", error);
-                this.port.postMessage(
+                postChannelMessage(this.port,
                     {
-                        action: ChannelAction.ERROR,
+                        type: ChannelMessageType.ERROR,
                         channelId,
                         data: extractTransferableError(error)
                     }
@@ -507,9 +559,9 @@ export class RpcServiceAdapter<P> {
                 this.callOutChannels.delete(channelId);
                 subscription.unsubscribe();
             }, () => {
-                this.port.postMessage(
+                postChannelMessage(this.port,
                     {
-                        action: ChannelAction.COMPLETE,
+                        type: ChannelMessageType.COMPLETE,
                         channelId
                     }
                 );
@@ -520,9 +572,9 @@ export class RpcServiceAdapter<P> {
         } else {
             Promise.resolve(result)
                 .then(resolvedResult => {
-                    this.port.postMessage(
+                    postChannelMessage(this.port,
                         {
-                            action: ChannelAction.RESOLVE,
+                            type: ChannelMessageType.RESOLVE,
                             channelId,
                             data: resolvedResult
                         }
@@ -530,9 +582,9 @@ export class RpcServiceAdapter<P> {
                 })
                 .catch((error: Error) => {
                     console.error("RpcServiceAdapter: forwarding error", error);
-                    this.port.postMessage(
+                    postChannelMessage(this.port,
                         {
-                            action: ChannelAction.ERROR,
+                            type: ChannelMessageType.ERROR,
                             channelId,
                             data: extractTransferableError(error)
                         }
@@ -549,7 +601,7 @@ export class RpcServiceAdapter<P> {
         entry = createClosableSubject(() => {
             this.port.postMessage(
                 {
-                    action: ChannelAction.CLOSE,
+                    action: ChannelMessageType.CLOSE,
                     channelId,
                 }
             )
@@ -564,7 +616,7 @@ export class RpcServiceAdapter<P> {
 // that's kind of magic
 // see https://rxjs.dev/guide/subject#reference-counting
 //
-function createClosableSubject<R>(onclose: () => void): [ Subject<R>, Observable<R>] {
+function createClosableSubject<R>(onclose: () => void): [Subject<R>, Observable<R>] {
     const sink = new Subject<R>();
     const o: Observable<R> = new Observable<R>((subscriber => {
         const s = sink.subscribe(subscriber);
@@ -577,3 +629,16 @@ function createClosableSubject<R>(onclose: () => void): [ Subject<R>, Observable
     const temp: Subject<R> = new Subject()
     return [sink, o.pipe(multicast(temp), refCount())];
 }
+
+//
+//
+//
+
+async function main() {
+
+}
+
+main().catch(error => {
+    console.error("??", error);
+    process.abort();
+});
