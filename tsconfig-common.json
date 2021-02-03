@@ -1,7 +1,7 @@
 {
     "compileOnSave": true,
     "compilerOptions": {
-        "target": "es5",
+        "target": "ES2017",
         "lib": [
             "es2017",
             "dom"
@@ -25,9 +25,5 @@
     },
     "exclude": [
         "node_modules"
-    ],
-    "include": [
-        "packages/*/*/src/**/*.ts",
-        "sandbox/"
     ]
 }

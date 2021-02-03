@@ -1,12 +1,10 @@
 {
   "extends": "../tsconfig-common.json",
   "compilerOptions": {
+    "target": "ES2017",
     "outDir": "dist",
-    "rootDir": "."
+    "composite": true
   },
-  "include": [
-    "./"
-  ],
   "exclude": [
     "dist/",
     "*.d.ts"
@@ -18,5 +16,5 @@
     {
       "path": "../packages/@ubo/cli"
     }
-  ],
+  ]
 }

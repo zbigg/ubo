@@ -1,9 +1,9 @@
 {
-    "extends": "./tsconfig-common.json",
-    "references": [
-        { "path": "packages/@ubo/core" },
-        { "path": "packages/@ubo/cli" },
-        { "path": "packages/@ubo/webapp" },
-        { "path": "sandbox"}
-    ]
+  "references": [
+    { "path": "./packages/@ubo/core" },
+    { "path": "./packages/@ubo/cli" },
+    { "path": "./packages/@ubo/webapp" },
+    { "path": "./sandbox" }
+  ],
+  "include": []
 }
