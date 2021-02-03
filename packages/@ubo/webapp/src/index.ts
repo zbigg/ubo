@@ -17,7 +17,10 @@ export async function createUboApi(
   return router;
 }
 
-export async function createUboWebApp(context: ExecutionContext, config?: Configuration): Promise<express.Router> {
+export async function createUboWebApp(
+  context: ExecutionContext,
+  config?: Configuration
+): Promise<express.Router> {
   const router = express.Router();
   // TODO:
   // TODO: serve webapp
